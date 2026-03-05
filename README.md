@@ -72,6 +72,10 @@ swift run SimpleTonerBar
 
 - [SwiftSnmpKit](https://github.com/darrellroot/SwiftSnmpKit) — SNMPv2c/v3 client library
 
+## Verified Printers
+
+ - HP Color LaserJet Pro 3201
+
 ## Built with
 
 This project was built with [Claude Code](https://claude.ai/code).
