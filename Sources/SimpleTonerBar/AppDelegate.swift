@@ -63,6 +63,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         statusItem.button?.title = "Searching…"
         statusItem.button?.image = NSImage(systemSymbolName: "printer.fill", accessibilityDescription: nil)
+        buildSearchingMenu()
 
         discovery.onPrinterFound = { [weak self] printer in
             guard let self else { return }
@@ -117,12 +118,31 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         cancelTimers()
         printerIP = ""
         printerURI = nil
-        statusItem.menu = nil
         statusItem.button?.attributedTitle = NSAttributedString(string: "")
         statusItem.button?.title = "Searching…"
         statusItem.button?.image = NSImage(systemSymbolName: "printer.fill", accessibilityDescription: nil)
+        buildSearchingMenu()
         discovery.stopDiscovery()
         discovery.startDiscovery()
+    }
+
+    /// Shown from launch until the first poll lands, so the icon is never inert.
+    private func buildSearchingMenu() {
+        let menu = NSMenu()
+
+        let searching = NSMenuItem(title: "Searching for a printer…", action: nil, keyEquivalent: "")
+        searching.isEnabled = false
+        menu.addItem(searching)
+
+        menu.addItem(NSMenuItem.separator())
+
+        let aboutItem = NSMenuItem(title: "About SimpleTonerBar", action: #selector(openAbout), keyEquivalent: "")
+        aboutItem.target = self
+        menu.addItem(aboutItem)
+
+        menu.addItem(NSMenuItem(title: "Quit", action: #selector(quit), keyEquivalent: "q"))
+
+        statusItem.menu = menu
     }
 
     private func moveToApplicationsIfNeeded() {
