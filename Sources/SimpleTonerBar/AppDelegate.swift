@@ -44,6 +44,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     var pollTimers: [Timer] = []
     var printerIP: String = ""
     var printerURI: String?
+    private var lastStatus: PrinterStatus?
+    private var appearanceObservation: NSKeyValueObservation?
 
     var currentSchedule: PollSchedule {
         get {
@@ -64,6 +66,13 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         statusItem.button?.title = "Searching…"
         statusItem.button?.image = NSImage(systemSymbolName: "printer.fill", accessibilityDescription: nil)
         buildSearchingMenu()
+
+        // Polls are hours apart, so redraw the bubbles when the menu bar flips
+        // between light and dark rather than leaving stale colors up.
+        appearanceObservation = statusItem.button?.observe(\.effectiveAppearance) { [weak self] _, _ in
+            guard let self, let status = self.lastStatus else { return }
+            self.updateUI(status: status)
+        }
 
         discovery.onPrinterFound = { [weak self] printer in
             guard let self else { return }
@@ -245,6 +254,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func updateUI(status: PrinterStatus) {
+        lastStatus = status
+
         if !status.isOnline {
             statusItem.button?.attributedTitle = NSAttributedString(string: "")
             statusItem.button?.title = "Offline"
@@ -258,20 +269,25 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         statusItem.button?.image = NSImage(systemSymbolName: "printer.fill", accessibilityDescription: nil)
         statusItem.button?.title = ""
 
-        let attributed = NSMutableAttributedString()
         let font = NSFont.menuBarFont(ofSize: 0)
+        let attributed = NSMutableAttributedString()
         attributed.append(NSAttributedString(string: " ", attributes: [.font: font]))
-        for (i, supply) in status.supplies.enumerated() {
-            if i > 0 {
-                attributed.append(NSAttributedString(string: " ", attributes: [.font: font]))
-            }
-            let circleAttachment = NSTextAttachment()
-            circleAttachment.image = colorCircleImage(colorForSupply(supply), size: 8)
-            circleAttachment.bounds = CGRect(x: 0, y: 1, width: 8, height: 8)
-            attributed.append(NSAttributedString(attachment: circleAttachment))
-            // A supply reporting an indeterminate level still needs to be visible.
-            let reading = supply.percent.map(String.init) ?? "?"
-            attributed.append(NSAttributedString(string: reading, attributes: [.font: font]))
+
+        // A supply reporting an indeterminate level still needs to be visible.
+        let readings = status.supplies.map {
+            MenuBarTitle.Reading(color: colorForSupply($0), text: $0.percent.map(String.init) ?? "?")
+        }
+        if let bubbles = MenuBarTitle.image(for: readings) {
+            let attachment = NSTextAttachment()
+            attachment.image = bubbles
+            // Center the bubbles on the text's optical middle rather than the baseline.
+            attachment.bounds = CGRect(
+                x: 0,
+                y: round(font.capHeight / 2 - bubbles.size.height / 2),
+                width: bubbles.size.width,
+                height: bubbles.size.height
+            )
+            attributed.append(NSAttributedString(attachment: attachment))
         }
         statusItem.button?.attributedTitle = attributed
 
