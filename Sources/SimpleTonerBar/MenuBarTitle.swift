@@ -15,22 +15,32 @@ enum MenuBarTitle {
         let text: String
     }
 
-    private static let dotSize: CGFloat = 7
-    /// Gap between the color dot and its number.
-    private static let dotTextGap: CGFloat = 4
-    private static let paddingH: CGFloat = 5
-    private static let paddingV: CGFloat = 2
-    private static let bubbleGap: CGFloat = 4
+    /// Bubble geometry, in points. Grouped so the whole strip can be retuned
+    /// (and rendered at several sizes side by side) without touching the drawing.
+    struct Metrics {
+        var dotSize: CGFloat = 6
+        /// Gap between the color dot and its number.
+        var dotTextGap: CGFloat = 3
+        var paddingH: CGFloat = 3.5
+        var paddingV: CGFloat = 1.5
+        var bubbleGap: CGFloat = 3
+        var fontSize: CGFloat = 11
 
-    static func font() -> NSFont {
-        // Monospaced digits keep the bubbles from resizing as levels tick down.
-        NSFont.monospacedDigitSystemFont(ofSize: 11, weight: .semibold)
+        var font: NSFont {
+            // Monospaced digits keep a bubble from resizing as its level ticks down.
+            NSFont.monospacedDigitSystemFont(ofSize: fontSize, weight: .semibold)
+        }
     }
 
-    static func image(for readings: [Reading]) -> NSImage? {
+    static func image(for readings: [Reading], metrics: Metrics = Metrics()) -> NSImage? {
         guard !readings.isEmpty else { return nil }
 
-        let font = font()
+        let font = metrics.font
+        let dotSize = metrics.dotSize
+        let dotTextGap = metrics.dotTextGap
+        let paddingH = metrics.paddingH
+        let paddingV = metrics.paddingV
+        let bubbleGap = metrics.bubbleGap
         let widths = readings.map { reading -> CGFloat in
             let textWidth = ceil((reading.text as NSString).size(withAttributes: [.font: font]).width)
             return paddingH + dotSize + dotTextGap + textWidth + paddingH
