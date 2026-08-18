@@ -53,7 +53,15 @@ cat > "$STAGING/Contents/Info.plist" << 'PLIST'
 PLIST
 
 echo "Installing to ${DEST}..."
-sudo ditto "$STAGING" "$DEST"
+# /Applications is group-writable by admin on stock macOS, so sudo is usually
+# unnecessary -- and it fails outright in a shell with no TTY for the password
+# prompt. Escalate only if the plain copy is actually refused.
+if ditto "$STAGING" "$DEST" 2>/dev/null; then
+    echo "Installed without sudo."
+else
+    echo "Plain copy refused, retrying with sudo..."
+    sudo ditto "$STAGING" "$DEST"
+fi
 rm -rf "$STAGING"
 
 echo "Done. ${APP_NAME} installed to ${DEST}"
