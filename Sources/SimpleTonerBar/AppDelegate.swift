@@ -43,6 +43,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     let discovery = PrinterDiscovery()
     var pollTimers: [Timer] = []
     var printerIP: String = ""
+    var printerURI: String?
 
     var currentSchedule: PollSchedule {
         get {
@@ -66,9 +67,61 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         discovery.onPrinterFound = { [weak self] printer in
             guard let self else { return }
             self.printerIP = printer.host
+            self.printerURI = printer.uri
             self.discovery.stopDiscovery()
             self.startRefreshLoop()
         }
+        discovery.onDiscoveryFailed = { [weak self] in
+            self?.showNoPrinterFound()
+        }
+        discovery.startDiscovery()
+    }
+
+    private func showNoPrinterFound() {
+        statusItem.button?.attributedTitle = NSAttributedString(string: "")
+        statusItem.button?.title = "No Printer"
+        statusItem.button?.image = NSImage(systemSymbolName: "exclamationmark.triangle", accessibilityDescription: nil)
+        statusItem.button?.toolTip = "No printer found via Bonjour or the CUPS printer list."
+        buildNoPrinterMenu()
+    }
+
+    private func buildNoPrinterMenu() {
+        let menu = NSMenu()
+
+        let statusMessage = NSMenuItem(title: "No printer found", action: nil, keyEquivalent: "")
+        statusMessage.isEnabled = false
+        menu.addItem(statusMessage)
+
+        let hint = NSMenuItem(title: "Add the printer in System Settings, then search again", action: nil, keyEquivalent: "")
+        hint.isEnabled = false
+        menu.addItem(hint)
+
+        menu.addItem(NSMenuItem.separator())
+
+        let searchItem = NSMenuItem(title: "Search Again", action: #selector(searchAgain), keyEquivalent: "r")
+        searchItem.target = self
+        menu.addItem(searchItem)
+
+        menu.addItem(NSMenuItem.separator())
+
+        let aboutItem = NSMenuItem(title: "About SimpleTonerBar", action: #selector(openAbout), keyEquivalent: "")
+        aboutItem.target = self
+        menu.addItem(aboutItem)
+
+        menu.addItem(NSMenuItem(title: "Quit", action: #selector(quit), keyEquivalent: "q"))
+
+        statusItem.menu = menu
+    }
+
+    @objc func searchAgain() {
+        cancelTimers()
+        printerIP = ""
+        printerURI = nil
+        statusItem.menu = nil
+        statusItem.button?.attributedTitle = NSAttributedString(string: "")
+        statusItem.button?.title = "Searching…"
+        statusItem.button?.image = NSImage(systemSymbolName: "printer.fill", accessibilityDescription: nil)
+        discovery.stopDiscovery()
         discovery.startDiscovery()
     }
 
@@ -121,7 +174,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         scheduleNextPolls()
     }
 
-    private func cancelTimers() {
+    func cancelTimers() {
         pollTimers.forEach { $0.invalidate() }
         pollTimers.removeAll()
     }
@@ -163,7 +216,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func refresh() {
-        monitor.fetch(host: printerIP) { status in
+        monitor.fetch(host: printerIP, uri: printerURI) { status in
             DispatchQueue.main.async {
                 self.lastUpdated = Date()
                 self.updateUI(status: status)
@@ -173,8 +226,12 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
     func updateUI(status: PrinterStatus) {
         if !status.isOnline {
+            statusItem.button?.attributedTitle = NSAttributedString(string: "")
             statusItem.button?.title = "Offline"
             statusItem.button?.image = NSImage(systemSymbolName: "wifi.slash", accessibilityDescription: nil)
+            statusItem.button?.toolTip =
+            "\(printerIP) answered neither SNMP nor IPP. Check that the printer is on the network and that SNMP or AirPrint is enabled."
+            buildMenu(status: status)
             return
         }
 
@@ -185,7 +242,6 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         let font = NSFont.menuBarFont(ofSize: 0)
         attributed.append(NSAttributedString(string: " ", attributes: [.font: font]))
         for (i, supply) in status.supplies.enumerated() {
-            guard let p = supply.percent else { continue }
             if i > 0 {
                 attributed.append(NSAttributedString(string: " ", attributes: [.font: font]))
             }
@@ -193,7 +249,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             circleAttachment.image = colorCircleImage(colorForSupply(supply), size: 8)
             circleAttachment.bounds = CGRect(x: 0, y: 1, width: 8, height: 8)
             attributed.append(NSAttributedString(attachment: circleAttachment))
-            attributed.append(NSAttributedString(string: "\(p)", attributes: [.font: font]))
+            // A supply reporting an indeterminate level still needs to be visible.
+            let reading = supply.percent.map(String.init) ?? "?"
+            attributed.append(NSAttributedString(string: reading, attributes: [.font: font]))
         }
         statusItem.button?.attributedTitle = attributed
 
@@ -202,7 +260,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         let updated = formatter.string(from: lastUpdated ?? Date())
 
         statusItem.button?.toolTip =
-        "IP: \(printerIP) | Pages: \(status.pageCount ?? 0) | Updated: \(updated)"
+        "IP: \(printerIP) | Pages: \(status.pageCount ?? 0) | Via: \(status.source.rawValue) | Updated: \(updated)"
 
         buildMenu(status: status)
     }
@@ -230,10 +288,15 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         let menu = NSMenu()
 
         for supply in status.supplies {
-            let percent = supply.percent ?? 0
-            var title = "\(supply.name): \(percent)%"
-            if let lvl = supply.level, let max = supply.maxCapacity, max > 0 {
-                title += " (\(lvl)/\(max))"
+            var title: String
+            if let percent = supply.percent {
+                title = "\(supply.name): \(percent)%"
+                // Raw counts only add something when they aren't just the percentage again.
+                if let lvl = supply.level, let max = supply.maxCapacity, max > 0, max != 100 {
+                    title += " (\(lvl)/\(max))"
+                }
+            } else {
+                title = "\(supply.name): level unknown"
             }
             let item = NSMenuItem(title: title, action: nil, keyEquivalent: "")
             item.image = colorCircleImage(colorForSupply(supply))
@@ -260,6 +323,14 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         }
 
         menu.addItem(NSMenuItem.separator())
+
+        let sourceItem = NSMenuItem(
+            title: status.isOnline ? "\(printerIP) via \(status.source.rawValue)" : "\(printerIP) unreachable",
+            action: nil,
+            keyEquivalent: ""
+        )
+        sourceItem.isEnabled = false
+        menu.addItem(sourceItem)
 
         if let updated = lastUpdated {
             let formatter = RelativeDateTimeFormatter()

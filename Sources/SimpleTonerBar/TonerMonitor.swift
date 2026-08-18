@@ -29,11 +29,19 @@ struct PaperTray {
     }
 }
 
+/// Which protocol produced a reading. Printers that answer one often refuse the other.
+enum StatusSource: String {
+    case snmp = "SNMP"
+    case ipp = "IPP"
+    case unreachable = "unreachable"
+}
+
 struct PrinterStatus {
     let supplies: [TonerSupply]
     let paperTrays: [PaperTray]
     let pageCount: Int?
     let isOnline: Bool
+    var source: StatusSource = .snmp
 }
 
 class TonerMonitor {
@@ -54,44 +62,59 @@ class TonerMonitor {
     private let inputMediaNameOID    = "1.3.6.1.2.1.43.8.2.1.12.1"
 
     private func snmpGet(host: String, oid: String) async -> Result<SnmpVariableBinding, Error> {
-        guard let sender = SnmpSender.shared else {
-            return .failure(SnmpError.noResponse)
-        }
-        return await sender.send(host: host, command: .getRequest, community: community, oid: oid)
+        await SnmpGate.shared.send(host: host, command: .getRequest, community: community, oid: oid)
     }
 
     private func snmpGetNext(host: String, oid: String) async -> Result<SnmpVariableBinding, Error> {
-        guard let sender = SnmpSender.shared else {
-            return .failure(SnmpError.noResponse)
-        }
-        return await sender.send(host: host, command: .getNextRequest, community: community, oid: oid)
+        await SnmpGate.shared.send(host: host, command: .getNextRequest, community: community, oid: oid)
     }
 
-    func fetch(host: String, completion: @escaping (PrinterStatus) -> Void) {
+    func fetch(host: String, uri: String? = nil, completion: @escaping (PrinterStatus) -> Void) {
         Task {
-            let status = await fetchAsync(host: host)
+            let status = await fetchAsync(host: host, uri: uri)
             completion(status)
         }
     }
 
-    private func fetchAsync(host: String) async -> PrinterStatus {
-        guard !host.isEmpty else {
-            return PrinterStatus(supplies: [], paperTrays: [], pageCount: nil, isOnline: false)
+    private func fetchAsync(host: String, uri: String?) async -> PrinterStatus {
+        let unreachable = PrinterStatus(
+            supplies: [], paperTrays: [], pageCount: nil, isOnline: false, source: .unreachable
+        )
+        guard !host.isEmpty else { return unreachable }
+
+        var snmpStatus: PrinterStatus?
+
+        if await checkOnline(host: host) {
+            async let suppliesResult = fetchAllSupplies(host: host)
+            async let pageCountResult = fetchPageCount(host: host)
+            async let traysResult = fetchAllPaperTrays(host: host)
+
+            let supplies = await suppliesResult
+            let pageCount = await pageCountResult
+            let trays = await traysResult
+
+            let status = PrinterStatus(
+                supplies: supplies, paperTrays: trays, pageCount: pageCount, isOnline: true, source: .snmp
+            )
+            if !supplies.isEmpty { return status }
+            // Answered SNMP but exposes no Printer MIB — IPP may still have the levels.
+            snmpStatus = status
         }
 
-        guard await checkOnline(host: host) else {
-            return PrinterStatus(supplies: [], paperTrays: [], pageCount: nil, isOnline: false)
+        // Plenty of current printers ship with SNMP disabled but always answer IPP.
+        if let ippStatus = await fetchOverIPP(host: host, uri: uri) {
+            return ippStatus
         }
 
-        async let suppliesResult = fetchAllSupplies(host: host)
-        async let pageCountResult = fetchPageCount(host: host)
-        async let traysResult = fetchAllPaperTrays(host: host)
+        return snmpStatus ?? unreachable
+    }
 
-        let supplies = await suppliesResult
-        let pageCount = await pageCountResult
-        let trays = await traysResult
-
-        return PrinterStatus(supplies: supplies, paperTrays: trays, pageCount: pageCount, isOnline: true)
+    private func fetchOverIPP(host: String, uri: String?) async -> PrinterStatus? {
+        await withCheckedContinuation { continuation in
+            DispatchQueue.global(qos: .utility).async {
+                continuation.resume(returning: IPPMonitor.fetch(host: host, uri: uri))
+            }
+        }
     }
 
     private func checkOnline(host: String) async -> Bool {
@@ -129,7 +152,7 @@ class TonerMonitor {
             let name: String
             switch binding.value {
             case .octetString(let data):
-                name = String(data: data, encoding: .utf8) ?? "Supply \(index)"
+                name = Self.normalizeName(String(data: data, encoding: .utf8)) ?? "Supply \(index)"
             default:
                 name = "Supply \(index)"
             }
@@ -210,7 +233,7 @@ class TonerMonitor {
             let name: String
             switch binding.value {
             case .octetString(let data):
-                name = String(data: data, encoding: .utf8) ?? "Tray \(index)"
+                name = Self.normalizeName(String(data: data, encoding: .utf8)) ?? "Tray \(index)"
             default:
                 name = "Tray \(index)"
             }
@@ -225,6 +248,14 @@ class TonerMonitor {
     private func fetchPageCount(host: String) async -> Int? {
         let result = await snmpGet(host: host, oid: pageCountOID)
         return extractInt(from: result)
+    }
+
+    /// Printers pad descriptions into fixed-width fields, e.g.
+    /// "Black Cartridge HP     W2180A". Collapse that for display.
+    private static func normalizeName(_ raw: String?) -> String? {
+        guard let raw else { return nil }
+        let collapsed = raw.split(whereSeparator: { $0.isWhitespace }).joined(separator: " ")
+        return collapsed.isEmpty ? nil : collapsed
     }
 
     private func extractInt(from result: Result<SnmpVariableBinding, Error>) -> Int? {

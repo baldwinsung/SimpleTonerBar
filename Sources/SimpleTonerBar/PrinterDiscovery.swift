@@ -8,6 +8,8 @@ struct DiscoveredPrinter: Identifiable, Hashable {
     let host: String
     let model: String
     let location: String
+    /// IPP URI to query when SNMP is unavailable, when we know it.
+    var uri: String?
 }
 
 class PrinterDiscovery: ObservableObject {
@@ -17,9 +19,17 @@ class PrinterDiscovery: ObservableObject {
     /// Called on the main queue each time a new printer is discovered.
     var onPrinterFound: ((DiscoveredPrinter) -> Void)?
 
+    /// Called on the main queue when Bonjour, `lpstat -v` and the `lpstat -s`
+    /// fallback have all come up empty.
+    var onDiscoveryFailed: (() -> Void)?
+
+    /// How long to give Bonjour and `lpstat -v` before falling back to `lpstat -s`.
+    var fallbackDelay: TimeInterval = 8
+
     private var browsers: [NWBrowser] = []
     private var resolvers: [String: NetService] = [:]
     private var activeResolvers: [String: ServiceResolver] = [:]
+    private var fallbackWorkItem: DispatchWorkItem?
 
     func startDiscovery() {
         printers = []
@@ -49,9 +59,13 @@ class PrinterDiscovery: ObservableObject {
             browser.start(queue: .global(qos: .userInitiated))
             browsers.append(browser)
         }
+
+        scheduleFallback()
     }
 
     func stopDiscovery() {
+        fallbackWorkItem?.cancel()
+        fallbackWorkItem = nil
         for browser in browsers {
             browser.cancel()
         }
@@ -71,13 +85,14 @@ class PrinterDiscovery: ObservableObject {
             let dict = Self.parseTXT(txt)
             let model = dict["ty"] ?? ""
             let location = dict["note"] ?? ""
+            let resourcePath = dict["rp"] ?? ""
 
             let service = NetService(domain: domain, type: type, name: name)
             let key = "\(name).\(type).\(domain)"
 
             if self.resolvers[key] != nil { continue }
 
-            let resolver = ServiceResolver(service: service, model: model, location: location) { [weak self] printer in
+            let resolver = ServiceResolver(service: service, model: model, location: location, resourcePath: resourcePath) { [weak self] printer in
                 guard let self, let printer else { return }
                 DispatchQueue.main.async {
                     if !self.printers.contains(where: { $0.host == printer.host }) {
@@ -90,6 +105,36 @@ class PrinterDiscovery: ObservableObject {
             self.activeResolvers[key] = resolver
             DispatchQueue.main.async {
                 resolver.resolve()
+            }
+        }
+    }
+
+    /// Arm the `lpstat -s` fallback in case Bonjour and `lpstat -v` turn up nothing.
+    private func scheduleFallback() {
+        fallbackWorkItem?.cancel()
+        let work = DispatchWorkItem { [weak self] in
+            self?.runFallbackDiscovery()
+        }
+        fallbackWorkItem = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + fallbackDelay, execute: work)
+    }
+
+    /// Last resort: `lpstat -s` also reports the system default destination, so we can
+    /// offer the printer the user actually prints to before any other queue.
+    private func runFallbackDiscovery() {
+        guard printers.isEmpty else { return }
+
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            guard let self else { return }
+            let found = Self.querySystemPrinters(summary: true)
+            DispatchQueue.main.async {
+                for printer in found where !self.printers.contains(where: { $0.host == printer.host }) {
+                    self.printers.append(printer)
+                    self.onPrinterFound?(printer)
+                }
+                if self.printers.isEmpty {
+                    self.onDiscoveryFailed?()
+                }
             }
         }
     }
@@ -110,11 +155,49 @@ class PrinterDiscovery: ObservableObject {
         }
     }
 
-    /// Parse `lpstat -v` output and resolve any .local hostnames to IPv4.
-    private static func querySystemPrinters() -> [DiscoveredPrinter] {
+    /// Parse `lpstat` output into printers. `-v` lists device URIs; `-s` adds the
+    /// system default destination line, which we surface first when present.
+    private static func querySystemPrinters(summary: Bool = false) -> [DiscoveredPrinter] {
+        guard let output = runLPStat(arguments: summary ? ["-s"] : ["-v"]) else { return [] }
+
+        var defaultName: String?
+        var devices: [(name: String, uri: String)] = []
+
+        // Lines look like: "device for PrinterName: ipp://host:port/path"
+        // or: "device for PrinterName: dnssd://Service%20Name._ipps._tcp.local./?uuid=..."
+        // `-s` additionally emits: "system default destination: PrinterName"
+        for line in output.components(separatedBy: "\n") {
+            guard let colonRange = line.range(of: ": ") else { continue }
+            let prefix = String(line[line.startIndex..<colonRange.lowerBound])
+            let value = String(line[colonRange.upperBound...]).trimmingCharacters(in: .whitespaces)
+
+            if prefix.hasSuffix("default destination") {
+                defaultName = value
+                continue
+            }
+
+            guard prefix.hasPrefix("device for ") else { continue }
+            devices.append((name: String(prefix.dropFirst("device for ".count)), uri: value))
+        }
+
+        if let defaultName, let index = devices.firstIndex(where: { $0.name == defaultName }) {
+            devices.insert(devices.remove(at: index), at: 0)
+        }
+
+        return devices.compactMap { device in
+            guard let ip = resolveIPFromURI(device.uri) else { return nil }
+            let displayName = device.name.replacingOccurrences(of: "_", with: " ")
+            let ippURI = device.uri.hasPrefix("ipp://") || device.uri.hasPrefix("ipps://") ? device.uri : nil
+            return DiscoveredPrinter(
+                name: displayName, host: ip, model: "", location: "System Printer", uri: ippURI
+            )
+        }
+    }
+
+    private static func runLPStat(arguments: [String]) -> String? {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/usr/bin/lpstat")
-        process.arguments = ["-v"]
+        process.arguments = arguments
         let pipe = Pipe()
         process.standardOutput = pipe
         process.standardError = Pipe()
@@ -122,36 +205,21 @@ class PrinterDiscovery: ObservableObject {
         do {
             try process.run()
         } catch {
-            return []
+            return nil
         }
 
         let data = pipe.fileHandleForReading.readDataToEndOfFile()
         process.waitUntilExit()
-
-        guard let output = String(data: data, encoding: .utf8) else { return [] }
-
-        var results: [DiscoveredPrinter] = []
-
-        // Lines look like: "device for PrinterName: ipp://host:port/path"
-        // or: "device for PrinterName: dnssd://Service%20Name._ipps._tcp.local./?uuid=..."
-        for line in output.components(separatedBy: "\n") {
-            guard let colonRange = line.range(of: ": ") else { continue }
-            let prefix = line[line.startIndex..<colonRange.lowerBound]
-            let uri = String(line[colonRange.upperBound...]).trimmingCharacters(in: .whitespaces)
-
-            // Extract printer name from "device for PrinterName"
-            let displayName = prefix.replacingOccurrences(of: "device for ", with: "")
-                .replacingOccurrences(of: "_", with: " ")
-
-            guard let ip = resolveIPFromURI(uri) else { continue }
-            results.append(DiscoveredPrinter(name: displayName, host: ip, model: "", location: "System Printer"))
-        }
-
-        return results
+        return String(data: data, encoding: .utf8)
     }
 
     /// Extract and resolve the host from a CUPS device URI to an IPv4 address.
     private static func resolveIPFromURI(_ uri: String) -> String? {
+        // Local queues have no network host to poll over SNMP
+        if uri.hasPrefix("usb://") || uri.hasPrefix("file://") || uri.hasPrefix("cups-pdf:") {
+            return nil
+        }
+
         // Handle dnssd:// URIs by extracting the Bonjour service name and resolving
         if uri.hasPrefix("dnssd://") {
             return resolveFromDnssdURI(uri)
@@ -163,12 +231,8 @@ class PrinterDiscovery: ObservableObject {
         // If it's already an IP address, return it
         if isIPv4(host) { return host }
 
-        // Resolve .local hostname
-        if host.hasSuffix(".local") || host.hasSuffix(".local.") {
-            return resolveLocalHostname(host)
-        }
-
-        return nil
+        // Resolve .local names via mDNS and everything else via DNS
+        return resolveHostname(host)
     }
 
     /// Resolve a dnssd:// URI by extracting the .local hostname from the service.
@@ -238,20 +302,20 @@ class PrinterDiscovery: ObservableObject {
         guard let colonRange = afterReach.range(of: ":") else { return nil }
         let hostname = String(afterReach[afterReach.startIndex..<colonRange.lowerBound])
 
-        return resolveLocalHostname(hostname)
+        return resolveHostname(hostname)
     }
 
-    /// Resolve a .local hostname to an IPv4 address using getaddrinfo.
-    private static func resolveLocalHostname(_ hostname: String) -> String? {
+    /// Resolve a hostname (.local via mDNS, anything else via DNS) to an IPv4 address.
+    private static func resolveHostname(_ hostname: String) -> String? {
         var hints = addrinfo()
         hints.ai_family = AF_INET
         hints.ai_socktype = SOCK_STREAM
         var result: UnsafeMutablePointer<addrinfo>?
 
         let status = getaddrinfo(hostname, nil, &hints, &result)
-        defer { freeaddrinfo(result) }
-
         guard status == 0, let info = result else { return nil }
+        defer { freeaddrinfo(info) }
+
         let addr = info.pointee.ai_addr.withMemoryRebound(to: sockaddr_in.self, capacity: 1) { $0.pointee }
         return String(cString: inet_ntoa(addr.sin_addr))
     }
@@ -274,13 +338,15 @@ private class ServiceResolver: NSObject, NetServiceDelegate {
     private let service: NetService
     private let model: String
     private let location: String
+    private let resourcePath: String
     private let completion: (DiscoveredPrinter?) -> Void
     private var resolved = false
 
-    init(service: NetService, model: String, location: String, completion: @escaping (DiscoveredPrinter?) -> Void) {
+    init(service: NetService, model: String, location: String, resourcePath: String, completion: @escaping (DiscoveredPrinter?) -> Void) {
         self.service = service
         self.model = model
         self.location = location
+        self.resourcePath = resourcePath
         self.completion = completion
         super.init()
         service.delegate = self
@@ -294,7 +360,9 @@ private class ServiceResolver: NSObject, NetServiceDelegate {
         guard !resolved else { return }
         resolved = true
         if let ip = ipv4Address(from: sender.addresses ?? []) {
-            completion(DiscoveredPrinter(name: sender.name, host: ip, model: model, location: location))
+            completion(DiscoveredPrinter(
+                name: sender.name, host: ip, model: model, location: location, uri: ippURI(host: ip, port: sender.port)
+            ))
         } else {
             completion(nil)
         }
@@ -304,6 +372,14 @@ private class ServiceResolver: NSObject, NetServiceDelegate {
         guard !resolved else { return }
         resolved = true
         completion(nil)
+    }
+
+    /// Rebuild the IPP URI from the Bonjour `rp` (resource path) TXT key.
+    private func ippURI(host: String, port: Int) -> String? {
+        guard !resourcePath.isEmpty else { return nil }
+        let scheme = service.type.hasPrefix("_ipps") ? "ipps" : "ipp"
+        let path = resourcePath.hasPrefix("/") ? resourcePath : "/\(resourcePath)"
+        return "\(scheme)://\(host):\(port > 0 ? port : 631)\(path)"
     }
 
     private func ipv4Address(from addresses: [Data]) -> String? {
